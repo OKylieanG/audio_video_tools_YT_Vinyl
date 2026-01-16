@@ -30,9 +30,6 @@ class AudioSilenceTrimmer:
         self.output_folder = tk.StringVar()
         self.input_format = tk.StringVar(value=".m4a")
         self.output_format = tk.StringVar(value="original")
-        self.silence_threshold = tk.StringVar(value="-50")
-        self.silence_duration = tk.StringVar(value="1.0")
-        self.min_audio_duration = tk.StringVar(value="0.5")
         self.enable_normalization = tk.BooleanVar(value=False)
         self.normalization_level = tk.StringVar(value="-1.0")
         self.overwrite_originals = tk.BooleanVar(value=False)
@@ -598,13 +595,10 @@ class AudioSilenceTrimmer:
             return
         
         try:
-            float(self.silence_threshold.get())
-            float(self.silence_duration.get())
-            float(self.min_audio_duration.get())
             if self.enable_normalization.get():
                 float(self.normalization_level.get())
         except ValueError:
-            messagebox.showerror("Error", "All numeric fields must contain valid numbers.")
+            messagebox.showerror("Error", "Normalization level must be a valid number.")
             return
         
         self.processing = True
