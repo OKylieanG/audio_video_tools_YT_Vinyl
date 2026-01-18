@@ -5,7 +5,6 @@ Automatically detects and removes silence from the beginning and end of audio fi
 Uses RMS loudness analysis to find when actual music starts.
 """
 
-import os
 import subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -13,9 +12,9 @@ from pathlib import Path
 from typing import Optional, Tuple
 import threading
 import uuid
+import traceback
 import numpy as np
 import soundfile as sf
-import pyloudnorm as pyln
 
 
 class AudioSilenceTrimmer:
@@ -71,8 +70,8 @@ class AudioSilenceTrimmer:
         # Mouse wheel binding
         def on_mouse_wheel(event):
             main_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        
-        main_canvas.bind_all("<MouseWheel>", on_mouse_wheel)
+
+        main_canvas.bind("<MouseWheel>", on_mouse_wheel)
         
         # Content frame with padding
         content = ttk.Frame(inner_frame, padding="15")
@@ -231,7 +230,28 @@ class AudioSilenceTrimmer:
             self.log(f"  Loading audio file...")
 
             # Load the audio file
-            audio, sample_rate = sf.read(file_path)
+            try:
+                audio, sample_rate = sf.read(file_path, dtype='float32')
+            except (MemoryError, Exception) as mem_err:
+                if 'allocate' not in str(mem_err).lower():
+                    raise  # Re-raise if not a memory error
+                # File too large, try chunked reading
+                self.log(f"  File is large, using memory-efficient processing...")
+                try:
+                    with sf.SoundFile(file_path) as f:
+                        sample_rate = f.samplerate
+                        # Read in chunks to avoid memory issues
+                        chunk_size = 10 * sample_rate  # 10 seconds at a time
+                        audio_chunks = []
+                        while True:
+                            chunk = f.read(chunk_size, dtype='float32')
+                            if len(chunk) == 0:
+                                break
+                            audio_chunks.append(chunk)
+                        audio = np.concatenate(audio_chunks, axis=0)
+                except Exception as e:
+                    self.log(f"  Error: Unable to load file even with chunked reading: {str(e)}")
+                    return None, None, 0
 
             # Convert to mono if stereo
             if len(audio.shape) > 1:
@@ -369,7 +389,6 @@ class AudioSilenceTrimmer:
 
         except Exception as e:
             self.log(f"Error detecting silence in {file_path}: {str(e)}")
-            import traceback
             self.log(traceback.format_exc())
             return None, None, 0
     
@@ -416,18 +435,18 @@ class AudioSilenceTrimmer:
                 self.log(f"  Skipped: Invalid duration ({duration}s)")
                 return
             
-            # Check if any actual trimming will occur
-            if track_start == 0 and track_end == total_length:
-                self.log(f"  Skipped: No silence to trim (file is already clean)")
-                return
-            
             self.log(f"  Total length: {total_length:.2f}s")
-            self.log(f"  Will trim from {track_start:.2f}s to {track_end:.2f}s (keeping {duration:.2f}s)")
-            
+
             # Calculate how much will be removed
             trimmed_start = track_start
             trimmed_end = total_length - track_end
-            if trimmed_start > 0 or trimmed_end > 0:
+
+            # Check if any actual trimming will occur
+            if track_start == 0 and track_end == total_length:
+                self.log(f"  No silence to trim (file is already clean)")
+                # Still process for format conversion or normalization if requested
+            else:
+                self.log(f"  Will trim from {track_start:.2f}s to {track_end:.2f}s (keeping {duration:.2f}s)")
                 self.log(f"  Removing: {trimmed_start:.2f}s from start, {trimmed_end:.2f}s from end")
             
             # Determine output file
@@ -447,7 +466,7 @@ class AudioSilenceTrimmer:
                     rel_path = Path(".")
                 output_subdir = output_dir / rel_path
                 output_subdir.mkdir(parents=True, exist_ok=True)
-                output_path = output_subdir / f"{file_path.stem}{output_ext}"
+                output_path = output_subdir / f"{file_path.stem}_trimmed{output_ext}"
             
             # Build ffmpeg command
             ffmpeg = self.ffmpeg_path.get()
@@ -516,7 +535,6 @@ class AudioSilenceTrimmer:
                         
         except Exception as e:
             self.log(f"  ✗ Error processing file: {str(e)}")
-            import traceback
             self.log(f"  {traceback.format_exc()}")
     
     def process_files(self):
@@ -528,7 +546,11 @@ class AudioSilenceTrimmer:
                 return
             
             if not self.overwrite_originals.get():
-                output_dir = Path(self.output_folder.get())
+                output_folder_str = self.output_folder.get().strip()
+                if not output_folder_str:
+                    messagebox.showerror("Error", "Output folder path is empty!")
+                    return
+                output_dir = Path(output_folder_str)
                 if not output_dir.exists():
                     output_dir.mkdir(parents=True, exist_ok=True)
             else:
