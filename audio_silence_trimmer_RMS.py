@@ -220,6 +220,35 @@ class AudioSilenceTrimmer:
         self.progress_text.delete(1.0, tk.END)
         self.progress_text.config(state='disabled')
     
+    def load_audio_with_ffmpeg(self, file_path: str) -> Tuple[Optional[np.ndarray], Optional[int]]:
+        """Load audio using FFmpeg for formats not supported by soundfile (like M4A/AAC)."""
+        try:
+            # Use FFmpeg to decode to raw PCM
+            cmd = [
+                self.ffmpeg_path.get(), '-i', file_path,
+                '-f', 's16le',  # 16-bit PCM
+                '-acodec', 'pcm_s16le',
+                '-ar', '44100',  # Standard sample rate
+                '-ac', '2',  # Stereo
+                '-'
+            ]
+
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            if result.returncode != 0:
+                self.log(f"  FFmpeg decode error: {result.stderr.decode()[:200]}")
+                return None, None
+
+            # Convert bytes to numpy array
+            audio = np.frombuffer(result.stdout, dtype=np.int16)
+            # Convert to float32 and normalize to [-1, 1]
+            audio = audio.astype(np.float32) / 32768.0
+
+            return audio, 44100
+        except Exception as e:
+            self.log(f"  Error loading with FFmpeg: {str(e)}")
+            return None, None
+
     def detect_silence(self, file_path: str) -> Tuple[Optional[float], Optional[float], float]:
         """
         Detect when actual music starts and ends in an audio file using RMS loudness analysis.
@@ -230,28 +259,52 @@ class AudioSilenceTrimmer:
             self.log(f"  Loading audio file...")
 
             # Load the audio file
+            audio = None
+            sample_rate = None
+
             try:
                 audio, sample_rate = sf.read(file_path, dtype='float32')
             except (MemoryError, Exception) as mem_err:
-                if 'allocate' not in str(mem_err).lower():
-                    raise  # Re-raise if not a memory error
-                # File too large, try chunked reading
-                self.log(f"  File is large, using memory-efficient processing...")
-                try:
-                    with sf.SoundFile(file_path) as f:
-                        sample_rate = f.samplerate
-                        # Read in chunks to avoid memory issues
-                        chunk_size = 10 * sample_rate  # 10 seconds at a time
-                        audio_chunks = []
-                        while True:
-                            chunk = f.read(chunk_size, dtype='float32')
-                            if len(chunk) == 0:
-                                break
-                            audio_chunks.append(chunk)
-                        audio = np.concatenate(audio_chunks, axis=0)
-                except Exception as e:
-                    self.log(f"  Error: Unable to load file even with chunked reading: {str(e)}")
-                    return None, None, 0
+                error_str = str(mem_err).lower()
+
+                # Check if it's a format not supported by soundfile
+                if 'format not recognised' in error_str or 'not supported' in error_str:
+                    self.log(f"  Format not supported by soundfile, using FFmpeg...")
+                    audio, sample_rate = self.load_audio_with_ffmpeg(file_path)
+                    if audio is None:
+                        return None, None, 0
+                elif 'allocate' in error_str:
+                    # File too large, try chunked reading
+                    self.log(f"  File is large, using memory-efficient processing...")
+                    try:
+                        with sf.SoundFile(file_path) as f:
+                            sample_rate = f.samplerate
+                            # Read in chunks to avoid memory issues
+                            chunk_size = 10 * sample_rate  # 10 seconds at a time
+                            audio_chunks = []
+                            while True:
+                                chunk = f.read(chunk_size, dtype='float32')
+                                if len(chunk) == 0:
+                                    break
+                                audio_chunks.append(chunk)
+                            audio = np.concatenate(audio_chunks, axis=0)
+                    except Exception as chunk_err:
+                        # If chunked reading also fails, try FFmpeg
+                        if 'format not recognised' in str(chunk_err).lower():
+                            self.log(f"  Format not supported, using FFmpeg...")
+                            audio, sample_rate = self.load_audio_with_ffmpeg(file_path)
+                            if audio is None:
+                                return None, None, 0
+                        else:
+                            self.log(f"  Error: Unable to load file: {str(chunk_err)}")
+                            return None, None, 0
+                else:
+                    raise  # Re-raise if unknown error
+
+            # Validate that audio was loaded successfully
+            if audio is None or sample_rate is None:
+                self.log(f"  Error: Failed to load audio file")
+                return None, None, 0
 
             # Convert to mono if stereo
             if len(audio.shape) > 1:
@@ -465,7 +518,11 @@ class AudioSilenceTrimmer:
                     # If relative path fails, just use the filename
                     rel_path = Path(".")
                 output_subdir = output_dir / rel_path
-                output_subdir.mkdir(parents=True, exist_ok=True)
+                try:
+                    output_subdir.mkdir(parents=True, exist_ok=True)
+                except Exception as e:
+                    self.log(f"  ✗ Error creating output subdirectory: {str(e)}")
+                    return
                 output_path = output_subdir / f"{file_path.stem}_trimmed{output_ext}"
             
             # Build ffmpeg command
@@ -500,9 +557,9 @@ class AudioSilenceTrimmer:
             
             # Add codec settings
             cmd.extend(codec_settings)
-            
-            # Add output file (use absolute path to avoid issues)
-            cmd.extend([str(output_path.absolute()), '-y'])
+
+            # Add output file with overwrite flag
+            cmd.extend(['-y', str(output_path)])
             
             # Log the command for debugging
             self.log(f"  Running: {' '.join(cmd)}")
@@ -551,8 +608,13 @@ class AudioSilenceTrimmer:
                     messagebox.showerror("Error", "Output folder path is empty!")
                     return
                 output_dir = Path(output_folder_str)
-                if not output_dir.exists():
-                    output_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    if not output_dir.exists():
+                        output_dir.mkdir(parents=True, exist_ok=True)
+                        self.log(f"Created output directory: {output_dir}")
+                except Exception as e:
+                    messagebox.showerror("Error", f"Could not create output directory: {str(e)}")
+                    return
             else:
                 output_dir = input_dir
             
